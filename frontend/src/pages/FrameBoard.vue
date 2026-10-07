@@ -2,13 +2,16 @@
 /**
  * 帧序编排台：在条带上移动帧、插入或删除帧、批量套用曝光，
  * 改动后重算帧序号与总时长。消费 FrameEntry、Shot。
+ * 帧序与曝光改动需要拍摄授权：只有当前持有人能操作，其余人只读。
  */
 import { computed, onMounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
+import { usePermitStore } from '../stores/permitStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useLocalDraft } from '../hooks/useLocalDraft';
+import { usePermit } from '../hooks/usePermit';
 import { durationToFrames, framesToDuration } from '../utils/frameMath';
 import { APERTURE_OPTIONS, EXPOSURE_OPTIONS, ISO_OPTIONS, SHUTTER_ANGLE_OPTIONS } from '../utils/exposure';
 import type { BatchExposure, FrameEntry } from '../types/frame';
@@ -20,9 +23,11 @@ import StatusTag from '../components/common/StatusTag.vue';
 
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
+const permitStore = usePermitStore();
 const { shots } = storeToRefs(shotStore);
 const { frames, selectedFrameNo } = storeToRefs(frameStore);
 const { insertAfter, removeAt, move, patch, select, syncShotRange, totalDuration, fps } = useFrameSequence();
+const { guarded } = usePermit();
 
 const activeShotId = ref<number | null>(null);
 const feedback = ref('');
@@ -47,6 +52,9 @@ const { draft: batch, reset: resetBatch } = useLocalDraft<BatchExposure>('frame-
 const activeShot = computed<Shot | undefined>(() => (activeShotId.value === null ? undefined : shotStore.byId(activeShotId.value)));
 const planned = computed(() => (activeShot.value ? durationToFrames(activeShot.value.durationSec, activeShot.value.fps) : 0));
 const ordered = computed(() => frames.value.slice().sort((a, b) => a.frameNo - b.frameNo));
+/** 当前操作人是否为该镜头持有人：决定编排台是否可编辑 */
+const canEdit = computed(() => (activeShotId.value === null ? false : permitStore.isHolder(activeShotId.value)));
+const holderName = computed(() => (activeShotId.value === null ? '' : permitStore.holderOf(activeShotId.value)));
 const exposureOptions = EXPOSURE_OPTIONS;
 const apertureOptions = APERTURE_OPTIONS;
 const isoOptions = ISO_OPTIONS;
@@ -54,6 +62,7 @@ const shutterOptions = SHUTTER_ANGLE_OPTIONS;
 
 onMounted(async () => {
   if (!shotStore.ready) await shotStore.load();
+  if (!permitStore.ready) await permitStore.load();
   const first = shots.value[0];
   if (first && typeof first.id === 'number') {
     activeShotId.value = first.id;
@@ -72,15 +81,26 @@ function flash(text: string) {
   }, 3200);
 }
 
+/** 需要授权的操作统一走这里：权限拒绝时把文案 flash 出来 */
+async function runGuarded(fn: () => Promise<unknown>, okText: string) {
+  const denied = await guarded(fn);
+  if (denied) {
+    flash(denied);
+    return;
+  }
+  flash(okText);
+}
+
 async function doInsert() {
   if (activeShotId.value === null) return;
-  await insertAfter(selectedFrameNo.value);
-  const created = frames.value.find((f) => f.frameNo === (selectedFrameNo.value ?? 0) + 1) ?? frames.value[frames.value.length - 1];
-  if (created) {
-    await patch(created.frameNo, newFrame.value);
-    select(created.frameNo);
-  }
-  flash('已插入一帧并重排序号');
+  await runGuarded(async () => {
+    await insertAfter(selectedFrameNo.value);
+    const created = frames.value.find((f) => f.frameNo === (selectedFrameNo.value ?? 0) + 1) ?? frames.value[frames.value.length - 1];
+    if (created) {
+      await patch(created.frameNo, newFrame.value);
+      select(created.frameNo);
+    }
+  }, '已插入一帧并重排序号');
 }
 
 async function doRemove() {
@@ -88,19 +108,17 @@ async function doRemove() {
     flash('请先点选要删除的帧');
     return;
   }
-  await removeAt(selectedFrameNo.value);
-  flash('已删除该帧并重排序号');
+  const frameNo = selectedFrameNo.value;
+  await runGuarded(() => removeAt(frameNo), '已删除该帧并重排序号');
 }
 
 async function doReorder(from: number, to: number) {
-  await move(from, to);
-  flash(`已把第 ${from + 1} 个色块移动到第 ${to + 1} 位`);
+  await runGuarded(() => move(from, to), `已把第 ${from + 1} 个色块移动到第 ${to + 1} 位`);
 }
 
 async function doBatch() {
   if (activeShotId.value === null) return;
-  await frameStore.applyBatch({ ...batch.value });
-  flash('已对全部帧批量套用曝光参数');
+  await runGuarded(() => frameStore.applyBatch({ ...batch.value }), '已对全部帧批量套用曝光参数');
 }
 
 async function doBatchSelectedOnly() {
@@ -109,19 +127,23 @@ async function doBatchSelectedOnly() {
     return;
   }
   const index = ordered.value.findIndex((f) => f.frameNo === selectedFrameNo.value);
-  await frameStore.applyBatch({ ...batch.value }, [index]);
-  flash('已对选中帧套用曝光参数');
+  await runGuarded(() => frameStore.applyBatch({ ...batch.value }, [index]), '已对选中帧套用曝光参数');
 }
 
 async function patchFrame(frameNo: number, value: Partial<FrameEntry>) {
-  await patch(frameNo, value);
+  const denied = await guarded(() => patch(frameNo, value));
+  if (denied) flash(denied);
+}
+
+async function recalcDuration() {
+  await runGuarded(() => syncShotRange(), '已按当前帧序重算时长');
 }
 
 function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
   const index = ordered.value.findIndex((f) => f.frameNo === frame.frameNo);
   const target = index + dir;
   if (target < 0 || target >= ordered.value.length) return;
-  void move(index, target);
+  void doReorder(index, target);
 }
 </script>
 
@@ -133,6 +155,7 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
         <p class="sub">在条带上移动、插入、删除帧，并批量套用曝光参数；改动后帧序号与镜头时长即时重算</p>
       </div>
       <div class="head-actions">
+        <span v-if="activeShot" class="holder-tag" data-testid="board-holder">持有人：{{ holderName || '待认领' }}</span>
         <select v-model.number="activeShotId" data-testid="board-shot-select" class="shot-select">
           <option :value="null" disabled>选择镜头</option>
           <option v-for="s in shots" :key="s.id" :value="s.id">{{ s.code }} · {{ s.sceneName }}</option>
@@ -162,12 +185,13 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
         <div class="panel-head">
           <h2>帧序条带</h2>
           <div class="head-actions">
-            <button type="button" class="btn small" data-testid="board-insert" @click="doInsert">插入帧</button>
-            <button type="button" class="btn small danger" data-testid="board-remove" @click="doRemove">删除选中帧</button>
-            <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
+            <span v-if="!canEdit" class="muted">仅持有人可改动帧序与曝光，当前为只读</span>
+            <button type="button" class="btn small" :disabled="!canEdit" data-testid="board-insert" @click="doInsert">插入帧</button>
+            <button type="button" class="btn small danger" :disabled="!canEdit" data-testid="board-remove" @click="doRemove">删除选中帧</button>
+            <button type="button" class="btn small" :disabled="!canEdit" @click="recalcDuration">重算时长</button>
           </div>
         </div>
-        <FrameStrip :frames="ordered" :selected="selectedFrameNo" @update:selected="select" @reorder="doReorder" @patch="patchFrame" />
+        <FrameStrip :frames="ordered" :selected="selectedFrameNo" :readonly="!canEdit" @update:selected="select" @reorder="doReorder" @patch="patchFrame" />
       </div>
 
       <div class="two-panel">
@@ -200,15 +224,15 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
             </label>
           </div>
           <div class="actions">
-            <button type="button" class="btn primary" data-testid="batch-apply" @click="doBatch">套用到全部帧</button>
-            <button type="button" class="btn" @click="doBatchSelectedOnly">仅套用到选中帧</button>
+            <button type="button" class="btn primary" :disabled="!canEdit" data-testid="batch-apply" @click="doBatch">套用到全部帧</button>
+            <button type="button" class="btn" :disabled="!canEdit" @click="doBatchSelectedOnly">仅套用到选中帧</button>
             <button type="button" class="btn" @click="resetBatch">复位参数</button>
           </div>
         </div>
 
         <div class="panel">
           <div class="panel-head"><h2>新帧曝光参数</h2><span class="muted">插入时写入</span></div>
-          <ExposureForm v-model="newFrame" :fps="fps" />
+          <ExposureForm v-model="newFrame" :fps="fps" :disabled="!canEdit" />
         </div>
       </div>
 
@@ -228,8 +252,8 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
               <td>{{ frame.iso }}</td>
               <td>{{ frame.propOffsetMm }}</td>
               <td class="row-actions">
-                <button type="button" class="btn tiny" :disabled="index === 0" @click.stop="shiftFrame(frame, -1)">上移</button>
-                <button type="button" class="btn tiny" :disabled="index === ordered.length - 1" @click.stop="shiftFrame(frame, 1)">下移</button>
+                <button type="button" class="btn tiny" :disabled="index === 0 || !canEdit" @click.stop="shiftFrame(frame, -1)">上移</button>
+                <button type="button" class="btn tiny" :disabled="index === ordered.length - 1 || !canEdit" @click.stop="shiftFrame(frame, 1)">下移</button>
               </td>
             </tr>
           </tbody>
@@ -422,5 +446,16 @@ h1 {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.holder-tag {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12px;
+  line-height: 20px;
+  background: #eef1ff;
+  color: #3d4fa8;
+  white-space: nowrap;
 }
 </style>

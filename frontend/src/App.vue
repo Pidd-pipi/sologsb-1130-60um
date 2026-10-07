@@ -1,11 +1,24 @@
 <script setup lang="ts">
-/** 应用外壳：顶部导航 + 路由出口 */
+/** 应用外壳：顶部导航 + 当前操作人（拍摄授权的操作身份）+ 路由出口 */
+import { computed, onMounted } from 'vue';
 import { RouterLink, RouterView, useRoute } from 'vue-router';
 import { navItems } from './router';
 import { useUiStore } from './stores/uiStore';
+import { usePermitStore } from './stores/permitStore';
 
 const route = useRoute();
 const ui = useUiStore();
+const permitStore = usePermitStore();
+
+/** 当前操作人：与拍摄授权的持有人比对，决定能否登记实拍、改动帧序或曝光 */
+const operator = computed({
+  get: () => permitStore.operator,
+  set: (name: string) => permitStore.setOperator(name),
+});
+
+onMounted(() => {
+  void permitStore.load();
+});
 
 function isActive(path: string): boolean {
   if (path === '/') return route.path === '/';
@@ -28,6 +41,10 @@ function isActive(path: string): boolean {
           {{ item.label }}
         </RouterLink>
       </nav>
+      <label class="operator-box" title="拍摄授权按操作人校验：只有持有人能登记实拍、改动帧序或曝光">
+        <span>当前操作人</span>
+        <input v-model="operator" type="text" maxlength="20" placeholder="未设置" data-testid="operator-input" />
+      </label>
     </header>
 
     <main class="content">
@@ -107,6 +124,25 @@ function isActive(path: string): boolean {
 .nav a.active {
   background: #2f6fed;
   color: #fff;
+}
+.operator-box {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #5a6472;
+  white-space: nowrap;
+}
+.operator-box input {
+  height: 30px;
+  width: 120px;
+  border: 1px solid #cfd6e0;
+  border-radius: 6px;
+  padding: 0 8px;
+  font-size: 13px;
+  background: #fff;
+  color: #1f2d3d;
 }
 .content {
   flex: 1;

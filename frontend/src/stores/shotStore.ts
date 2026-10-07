@@ -3,6 +3,8 @@ import { defineStore } from 'pinia';
 import * as api from '../db/api';
 import { toPlain } from '../db';
 import { buildFrameRange, framesToDuration } from '../utils/frameMath';
+import { usePermitStore } from './permitStore';
+import { refreshTakesCache } from '../hooks/takeCache';
 import type { Shot } from '../types/shot';
 import { createEmptyShot } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
@@ -65,10 +67,15 @@ export const useShotStore = defineStore('shot', {
       this.currentId = id;
       return saved;
     },
-    /** 改时长/帧率后重排帧区间，并同步到该镜头的全部帧条目 */
+    /**
+     * 改时长/帧率后重排帧区间，并同步到该镜头的全部帧条目。
+     * 帧区间属于帧序的一部分：只有授权持有人能改，
+     * 改动成功后已确认的实拍进度立刻作废重算，待持有人重新确认。
+     */
     async update(id: number, patch: Partial<Shot>) {
       const existing = this.shots.find((s) => s.id === id);
       if (!existing) return;
+      await usePermitStore().assertHolder(id, '改动帧序');
       const next = toPlain({ ...existing, ...patch });
       const range = buildFrameRange(next.startFrame, next.durationSec, next.fps);
       next.startFrame = range.startFrame;
@@ -76,6 +83,9 @@ export const useShotStore = defineStore('shot', {
       await api.updateShot(id, next);
       this.shots = this.shots.map((s) => (s.id === id ? { ...next, id } : s));
       await this.rerangeFrames(id);
+      const percent = await api.invalidateConfirmedTakes(id, '帧序改动');
+      this.applyProgressSnapshot(id, percent);
+      await refreshTakesCache();
     },
     /** 把帧序号重新压缩进 [startFrame, endFrame]，并重算时长 */
     async rerangeFrames(shotId: number) {
@@ -96,9 +106,14 @@ export const useShotStore = defineStore('shot', {
       await api.syncShotProgress(id, percent);
       this.shots = this.shots.map((s) => (s.id === id ? { ...s, progressPercent: percent } : s));
     },
+    /** 只更新内存中的进度快照（库内百分比已由事务化重算写妥） */
+    applyProgressSnapshot(id: number, percent: number) {
+      this.shots = this.shots.map((s) => (s.id === id ? { ...s, progressPercent: percent } : s));
+    },
     async remove(id: number) {
       await api.deleteShot(id);
       this.shots = this.shots.filter((s) => s.id !== id);
+      usePermitStore().dropForShot(id);
       if (this.currentId === id) this.currentId = null;
     },
     /** 依据时长给出帧区间预览（不落库） */

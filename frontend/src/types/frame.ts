@@ -50,3 +50,21 @@ export interface BatchExposure {
   iso: number;
   shutterAngle: number;
 }
+
+/**
+ * 曝光类字段：这些字段一改动就视为「动了曝光」，
+ * 已确认的实拍进度要作废重算（道具位移与备注不算）。
+ */
+export const EXPOSURE_FIELD_KEYS: (keyof FrameEntry)[] = [
+  'shotCount',
+  'exposureSec',
+  'aperture',
+  'iso',
+  'shutterAngle',
+  'lighting',
+];
+
+/** 判断一次帧修改是否触及曝光类字段 */
+export function touchesExposure(patch: Partial<FrameEntry>): boolean {
+  return Object.keys(patch).some((key) => (EXPOSURE_FIELD_KEYS as string[]).includes(key));
+}

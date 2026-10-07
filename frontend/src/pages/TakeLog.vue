@@ -2,11 +2,15 @@
 /**
  * 实拍记录：登记当日实拍张数与废帧数，自动回写镜头完成百分比并提示剩余张数。
  * 消费 TakeLog、Shot；复用 ShotProgress 与 useProgress。
+ * 登记与重新确认需要拍摄授权：只有当前持有人能操作；
+ * 帧序或曝光改动后被作废的记录在这里由持有人重新确认。
  */
 import { computed, onMounted, ref } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
+import { usePermitStore } from '../stores/permitStore';
 import { useProgress } from '../hooks/useProgress';
+import { usePermit } from '../hooks/usePermit';
 import { formatDateTime, today } from '../utils/format';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
@@ -14,8 +18,10 @@ import EmptyState from '../components/common/EmptyState.vue';
 import type { TakeLog } from '../types/take';
 
 const shotStore = useShotStore();
+const permitStore = usePermitStore();
 const { shots } = storeToRefs(shotStore);
-const { takes, summaries, overall, wasteBuckets, loadTakes, registerTake, removeTake, loading } = useProgress();
+const { takes, summaries, overall, wasteBuckets, loadTakes, registerTake, confirmTakes, removeTake, loading } = useProgress();
+const { guarded } = usePermit();
 
 const selectedShotId = ref<number | null>(null);
 const form = ref({ date: today(), takenFrames: 8, wastedFrames: 0 });
@@ -23,9 +29,13 @@ const feedback = ref('');
 
 const selectedShot = computed(() => (selectedShotId.value === null ? undefined : shotStore.byId(selectedShotId.value)));
 const selectedSummary = computed(() => summaries.value.find((s) => s.shotId === selectedShotId.value));
+/** 当前操作人是否为所选镜头持有人：决定能否登记/确认实拍 */
+const canRegister = computed(() => (selectedShotId.value === null ? false : permitStore.isHolder(selectedShotId.value)));
+const holderName = computed(() => (selectedShotId.value === null ? '' : permitStore.holderOf(selectedShotId.value)));
 
 onMounted(async () => {
   if (!shotStore.ready) await shotStore.load();
+  if (!permitStore.ready) await permitStore.load();
   await loadTakes();
   const first = shots.value[0];
   if (first && typeof first.id === 'number') selectedShotId.value = first.id;
@@ -36,6 +46,16 @@ function flash(text: string) {
   window.setTimeout(() => {
     if (feedback.value === text) feedback.value = '';
   }, 3200);
+}
+
+/** 需要授权的操作统一走这里：权限拒绝时把文案 flash 出来 */
+async function runGuarded(fn: () => Promise<unknown>, okText: string) {
+  const denied = await guarded(fn);
+  if (denied) {
+    flash(denied);
+    return;
+  }
+  flash(okText);
 }
 
 async function submit() {
@@ -54,16 +74,33 @@ async function submit() {
     flash('废帧数不能多于实拍张数');
     return;
   }
-  await registerTake(shot, form.value.date, taken, wasted);
-  await loadTakes();
-  flash(`${shot.code} 已登记 ${taken} 张，完成度回写为 ${selectedSummary.value?.percent ?? 0}%`);
+  await runGuarded(async () => {
+    await registerTake(shot, form.value.date, taken, wasted);
+  }, `${shot.code} 已登记 ${taken} 张，完成度回写为 ${selectedSummary.value?.percent ?? 0}%`);
+}
+
+/** 持有人重新确认一条被作废的实拍记录 */
+async function confirmRow(row: TakeLog) {
+  if (typeof row.id !== 'number') return;
+  const shot = shotStore.byId(row.shotId);
+  if (!shot) return;
+  await runGuarded(async () => {
+    await confirmTakes(shot, [row.id as number]);
+  }, `${row.shotCode} 该条实拍已重新确认，进度已重算`);
+}
+
+/** 持有人一键确认当前镜头的全部待确认记录 */
+async function confirmAllForSelected() {
+  const shot = selectedShot.value;
+  if (!shot) return;
+  const count = selectedSummary.value?.pending ?? 0;
+  await runGuarded(() => confirmTakes(shot), `${shot.code} 已重新确认 ${count} 张，进度已重算`);
 }
 
 async function removeRow(row: TakeLog) {
   if (typeof row.id !== 'number') return;
   await removeTake(row.id);
-  await loadTakes();
-  flash('已删除该条实拍记录');
+  flash('已删除该条实拍记录并重算进度');
 }
 </script>
 
@@ -78,6 +115,7 @@ async function removeRow(row: TakeLog) {
         <span>全片完成度</span>
         <strong>{{ overall.percent }}%</strong>
         <span>待拍 {{ overall.remaining }} 张</span>
+        <span v-if="overall.pending" class="pending-inline">待确认 {{ overall.pending }} 张</span>
       </div>
     </header>
 
@@ -88,7 +126,16 @@ async function removeRow(row: TakeLog) {
     <template v-else>
       <div class="two-panel">
         <div class="panel">
-          <div class="panel-head"><h2>登记实拍</h2><StatusTag v-if="selectedShot" :status="selectedShot.status" /></div>
+          <div class="panel-head">
+            <h2>登记实拍</h2>
+            <div class="head-tags">
+              <span v-if="selectedShot" class="holder-tag" data-testid="take-holder">持有人：{{ holderName || '待认领' }}</span>
+              <StatusTag v-if="selectedShot" :status="selectedShot.status" />
+            </div>
+          </div>
+          <p v-if="selectedShot && !canRegister" class="muted permit-hint">
+            只有持有人 {{ holderName || '（待认领）' }} 能登记 {{ selectedShot.code }} 的实拍张数；交接或认领请到镜头详情页。
+          </p>
           <div class="form-grid">
             <label class="field">
               <span>镜头</span>
@@ -96,20 +143,31 @@ async function removeRow(row: TakeLog) {
                 <option v-for="s in shots" :key="s.id" :value="s.id">{{ s.code }} · {{ s.sceneName }}</option>
               </select>
             </label>
-            <label class="field"><span>拍摄日期</span><input v-model="form.date" type="date" data-testid="take-log-date" /></label>
+            <label class="field"><span>拍摄日期</span><input v-model="form.date" type="date" :disabled="!canRegister" data-testid="take-log-date" /></label>
             <label class="field">
               <span>实拍张数</span>
-              <input v-model.number="form.takenFrames" type="number" min="1" max="2000" step="1" data-testid="take-log-taken" />
+              <input v-model.number="form.takenFrames" type="number" min="1" max="2000" step="1" :disabled="!canRegister" data-testid="take-log-taken" />
             </label>
             <label class="field">
               <span>废帧数</span>
-              <input v-model.number="form.wastedFrames" type="number" min="0" max="500" step="1" data-testid="take-log-wasted" />
+              <input v-model.number="form.wastedFrames" type="number" min="0" max="500" step="1" :disabled="!canRegister" data-testid="take-log-wasted" />
             </label>
           </div>
           <div class="actions">
-            <button type="button" class="btn primary" data-testid="take-log-submit" @click="submit">登记实拍</button>
+            <button type="button" class="btn primary" :disabled="!canRegister" data-testid="take-log-submit" @click="submit">登记实拍</button>
+            <button
+              v-if="selectedSummary && selectedSummary.pending > 0"
+              type="button"
+              class="btn"
+              :disabled="!canRegister"
+              data-testid="take-confirm-selected"
+              @click="confirmAllForSelected"
+            >
+              确认本镜头全部待确认（{{ selectedSummary.pending }} 张）
+            </button>
             <span class="muted" v-if="selectedSummary">
               计划 {{ selectedSummary.planned }} 张 · 已拍 {{ selectedSummary.taken }} 张 · 剩余 {{ selectedSummary.remaining }} 张
+              <template v-if="selectedSummary.pending"> · 待确认 {{ selectedSummary.pending }} 张</template>
             </span>
           </div>
         </div>
@@ -125,6 +183,7 @@ async function removeRow(row: TakeLog) {
             :wasted="selectedSummary.wasted"
             :remaining="selectedSummary.remaining"
             :percent="selectedSummary.percent"
+            :pending="selectedSummary.pending"
           />
           <p v-else class="muted">请选择镜头。</p>
 
@@ -142,21 +201,38 @@ async function removeRow(row: TakeLog) {
       </div>
 
       <div class="panel">
-        <div class="panel-head"><h2>实拍记录清单</h2><span class="muted">共 {{ takes.length }} 条</span></div>
+        <div class="panel-head"><h2>实拍记录清单</h2><span class="muted">共 {{ takes.length }} 条 · 进度只累计已确认张数</span></div>
         <table v-if="takes.length" class="table" data-testid="take-table">
           <thead>
-            <tr><th>拍摄日期</th><th>镜号</th><th>实拍张数</th><th>废帧数</th><th>剩余张数</th><th>完成百分比</th><th>登记时间</th><th>操作</th></tr>
+            <tr><th>拍摄日期</th><th>镜号</th><th>实拍张数</th><th>废帧数</th><th>剩余张数</th><th>完成百分比</th><th>确认状态</th><th>确认人</th><th>登记时间</th><th>操作</th></tr>
           </thead>
           <tbody>
-            <tr v-for="row in takes" :key="row.id">
+            <tr v-for="row in takes" :key="row.id" :class="{ stale: !row.confirmed }">
               <td class="mono">{{ row.date }}</td>
               <td class="mono">{{ row.shotCode }}</td>
               <td>{{ row.takenFrames }}</td>
               <td>{{ row.wastedFrames }}</td>
               <td>{{ row.remainingFrames }}</td>
               <td>{{ row.percent }}%</td>
+              <td>
+                <span v-if="row.confirmed" class="tag ok">已确认</span>
+                <span v-else class="tag stale" :title="row.invalidReason ? `作废原因：${row.invalidReason}` : ''">待确认{{ row.invalidReason ? `（${row.invalidReason}）` : '' }}</span>
+              </td>
+              <td>{{ row.confirmedBy || '—' }}</td>
               <td class="muted">{{ formatDateTime(row.updatedAt) }}</td>
-              <td><button type="button" class="btn tiny danger" @click="removeRow(row)">删除</button></td>
+              <td class="row-actions">
+                <button
+                  v-if="!row.confirmed"
+                  type="button"
+                  class="btn tiny"
+                  :disabled="!permitStore.isHolder(row.shotId)"
+                  data-testid="take-row-confirm"
+                  @click="confirmRow(row)"
+                >
+                  确认
+                </button>
+                <button type="button" class="btn tiny danger" @click="removeRow(row)">删除</button>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -339,5 +415,52 @@ h1 {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.head-tags {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.holder-tag {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12px;
+  line-height: 20px;
+  background: #eef1ff;
+  color: #3d4fa8;
+  white-space: nowrap;
+}
+.permit-hint {
+  margin: 0 0 10px;
+}
+.pending-inline {
+  color: #a8730f;
+  font-weight: 600;
+}
+.tag {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0 8px;
+  font-size: 11px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+.tag.ok {
+  background: #e4f5ec;
+  color: #227a52;
+}
+.tag.stale {
+  background: #fff3dc;
+  color: #a8730f;
+}
+tr.stale td {
+  color: #8a94a6;
+}
+.row-actions {
+  display: flex;
+  gap: 6px;
 }
 </style>

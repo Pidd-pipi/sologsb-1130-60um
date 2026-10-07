@@ -1,17 +1,21 @@
 /**
  * 帧序编排：插入 / 删除 / 移动帧并重排帧序号，联动镜头帧区间。
  * 被 /frames 与 /shots/:id 消费。
+ * 帧序与曝光属于授权操作：只有当前持有人能改，否则抛 PermitDeniedError。
  */
 import { computed } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useFrameStore } from '../stores/frameStore';
 import { useShotStore } from '../stores/shotStore';
+import { usePermitStore } from '../stores/permitStore';
 import { durationToFrames, framesToDuration } from '../utils/frameMath';
 import type { FrameEntry } from '../types/frame';
+import { touchesExposure } from '../types/frame';
 
 export function useFrameSequence() {
   const frameStore = useFrameStore();
   const shotStore = useShotStore();
+  const permitStore = usePermitStore();
   const { frames, selectedFrameNo } = storeToRefs(frameStore);
 
   const shotId = computed(() => frameStore.shotId);
@@ -21,13 +25,20 @@ export function useFrameSequence() {
   const totalDuration = computed(() => framesToDuration(frameCount.value, fps.value));
   const plannedFrames = computed(() => durationToFrames(shot.value?.durationSec ?? 0, fps.value));
 
+  /** 授权闸门：非持有人改动帧序/曝光会被权限拒绝 */
+  async function assertPermit(action: string) {
+    if (shotId.value !== null) await permitStore.assertHolder(shotId.value, action);
+  }
+
   async function insertAfter(frameNo: number | null) {
+    await assertPermit('改动帧序');
     const index = frameNo === null ? frames.value.length : frames.value.findIndex((f) => f.frameNo === frameNo) + 1;
     await frameStore.insertAt(Math.max(0, index));
     await syncShotRange();
   }
 
   async function removeAt(frameNo: number) {
+    await assertPermit('改动帧序');
     const index = frames.value.findIndex((f) => f.frameNo === frameNo);
     if (index < 0) return;
     await frameStore.removeAt(index);
@@ -35,6 +46,7 @@ export function useFrameSequence() {
   }
 
   async function move(fromIndex: number, toIndex: number) {
+    await assertPermit('改动帧序');
     await frameStore.move(fromIndex, toIndex);
     await syncShotRange();
   }
@@ -46,6 +58,7 @@ export function useFrameSequence() {
    */
   async function syncShotRange() {
     if (shotId.value === null) return;
+    await assertPermit('改动帧序');
     const current = shotStore.byId(shotId.value);
     if (!current) return;
     const fps = current.fps || 24;
@@ -58,8 +71,9 @@ export function useFrameSequence() {
     });
   }
 
-  /** 条带上的单帧曝光/位移改动 */
+  /** 条带上的单帧曝光/位移改动；触及曝光字段需持有人授权 */
   async function patch(frameNo: number, patchValue: Partial<FrameEntry>) {
+    if (touchesExposure(patchValue)) await assertPermit('修改曝光');
     await frameStore.patchFrame(frameNo, patchValue);
   }
 

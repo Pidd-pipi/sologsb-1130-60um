@@ -15,6 +15,16 @@ export interface TakeLog {
   remainingFrames: number;
   /** 完成百分比 0-100 */
   percent: number;
+  /** 是否已确认：帧序或曝光改动后会被作废为待确认，需持有人重新确认 */
+  confirmed: boolean;
+  /** 确认人（登记即确认的填登记时的持有人） */
+  confirmedBy: string;
+  /** 确认时间戳，未确认为 0 */
+  confirmedAt: number;
+  /** 作废原因（帧序改动 / 曝光改动），未作废为空串 */
+  invalidReason: string;
+  /** 作废时间戳，未作废为 0 */
+  invalidatedAt: number;
   updatedAt: number;
 }
 
@@ -26,6 +36,11 @@ export const createEmptyTake = (shotId: number, shotCode: string): TakeLog => ({
   wastedFrames: 0,
   remainingFrames: 0,
   percent: 0,
+  confirmed: true,
+  confirmedBy: '',
+  confirmedAt: 0,
+  invalidReason: '',
+  invalidatedAt: 0,
   updatedAt: Date.now(),
 });
 

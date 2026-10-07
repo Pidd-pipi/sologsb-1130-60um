@@ -3,8 +3,11 @@ import { defineStore } from 'pinia';
 import * as api from '../db/api';
 import { toPlain } from '../db';
 import { accumulateOffsets, estimateSpeed, frameColor, framesToDuration } from '../utils/frameMath';
+import { usePermitStore } from './permitStore';
+import { useShotStore } from './shotStore';
+import { refreshTakesCache } from '../hooks/takeCache';
 import type { BatchExposure, FrameEntry } from '../types/frame';
-import { createEmptyFrame } from '../types/frame';
+import { createEmptyFrame, touchesExposure } from '../types/frame';
 
 interface FrameState {
   frames: FrameEntry[];
@@ -53,13 +56,24 @@ export const useFrameStore = defineStore('frame', {
     select(frameNo: number | null) {
       this.selectedFrameNo = frameNo;
     },
-    /** 整段帧序落库（脱代理后写入），帧序号按数组顺序重排 */
-    async persist() {
+    /**
+     * 整段帧序落库（脱代理后写入），帧序号按数组顺序重排。
+     * 落库成功即视为帧序/曝光已改动：已确认的实拍进度立刻作废重算。
+     */
+    async persist(reason = '帧序改动') {
       if (this.shotId === null) return;
       const ordered = this.frames.map((f, idx) => ({ ...f, frameNo: idx + 1, shotId: this.shotId as number }));
       await api.replaceShotFrames(this.shotId, toPlain(ordered));
       this.frames = await api.listFrames(this.shotId);
       this.dirty = false;
+      await this.invalidateTakes(reason);
+    },
+    /** 作废该镜头已确认的实拍进度并重算（帧序/曝光改动后的联动） */
+    async invalidateTakes(reason: string) {
+      if (this.shotId === null) return;
+      const percent = await api.invalidateConfirmedTakes(this.shotId, reason);
+      useShotStore().applyProgressSnapshot(this.shotId, percent);
+      await refreshTakesCache();
     },
     async insertAt(index: number, seed?: Partial<FrameEntry>) {
       const base = createEmptyFrame(this.shotId ?? 0, index + 1);
@@ -101,8 +115,9 @@ export const useFrameStore = defineStore('frame', {
       this.dirty = true;
       await this.persist();
     },
-    /** 批量套用曝光参数 */
+    /** 批量套用曝光参数（仅授权持有人可操作） */
     async applyBatch(batch: BatchExposure, indexes?: number[]) {
+      if (this.shotId !== null) await usePermitStore().assertHolder(this.shotId, '批量套用曝光');
       const target = indexes && indexes.length ? new Set(indexes) : null;
       this.frames = this.frames.map((f, idx) => {
         if (target && !target.has(idx)) return f;
@@ -115,9 +130,9 @@ export const useFrameStore = defineStore('frame', {
           updatedAt: Date.now(),
         };
       });
-      await this.persist();
+      await this.persist('曝光改动');
     },
-    /** 就地更新单帧字段（镜头详情页表格 / 条带位移量） */
+    /** 就地更新单帧字段（镜头详情页表格 / 条带位移量）；触及曝光字段则作废已确认进度 */
     async patchFrame(frameNo: number, patch: Partial<FrameEntry>) {
       const idx = this.frames.findIndex((f) => f.frameNo === frameNo);
       if (idx < 0) return;
@@ -127,6 +142,7 @@ export const useFrameStore = defineStore('frame', {
         const { id, ...rest } = next;
         await api.updateFrame(id, toPlain(rest));
       }
+      if (touchesExposure(patch)) await this.invalidateTakes('曝光改动');
     },
     /** 条带单帧颜色：按曝光与位移量着色 */
     colorOf(frame: FrameEntry): string {

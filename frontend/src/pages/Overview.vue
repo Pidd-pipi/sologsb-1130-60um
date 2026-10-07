@@ -8,6 +8,7 @@ import { useRouter } from 'vue-router';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
+import { usePermitStore } from '../stores/permitStore';
 import { useProgress } from '../hooks/useProgress';
 import { listAllFrames } from '../db/api';
 import { framesToDuration } from '../utils/frameMath';
@@ -20,6 +21,7 @@ import type { FrameEntry } from '../types/frame';
 const router = useRouter();
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
+const permitStore = usePermitStore();
 const { shots } = storeToRefs(shotStore);
 const { summaries, overall, loadTakes, loading } = useProgress();
 
@@ -27,6 +29,7 @@ const allFrames = ref<FrameEntry[]>([]);
 
 onMounted(async () => {
   await shotStore.load();
+  if (!permitStore.ready) await permitStore.load();
   await loadTakes();
   allFrames.value = await listAllFrames();
 });
@@ -87,7 +90,7 @@ function goDetail(id: number | undefined) {
       <div class="stat">
         <span class="label">累计实拍张数</span>
         <span class="value">{{ overall.taken }}</span>
-        <span class="hint">废帧 {{ overall.wasted }} 张</span>
+        <span class="hint">废帧 {{ overall.wasted }} 张<template v-if="overall.pending"> · 待确认 {{ overall.pending }} 张</template></span>
       </div>
       <div class="stat">
         <span class="label">待拍张数</span>
@@ -122,6 +125,7 @@ function goDetail(id: number | undefined) {
             <th>预计时长</th>
             <th>完成度</th>
             <th>负责人</th>
+            <th>持有人</th>
             <th>操作</th>
           </tr>
         </thead>
@@ -142,9 +146,14 @@ function goDetail(id: number | undefined) {
                 :wasted="row.summary?.wasted ?? 0"
                 :remaining="row.summary?.remaining ?? 0"
                 :percent="row.summary?.percent ?? 0"
+                :pending="row.summary?.pending ?? 0"
               />
             </td>
             <td>{{ row.shot.owner || '未指派' }}</td>
+            <td>
+              <span v-if="row.shot.id !== undefined && permitStore.holderOf(row.shot.id)" class="holder-tag">{{ permitStore.holderOf(row.shot.id) }}</span>
+              <span v-else class="muted">待认领</span>
+            </td>
             <td>
               <button type="button" class="btn small" @click="goDetail(row.shot.id)">查看详情</button>
             </td>
@@ -250,6 +259,17 @@ h1 {
 }
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.holder-tag {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0 8px;
+  font-size: 11px;
+  line-height: 20px;
+  background: #eef1ff;
+  color: #3d4fa8;
+  white-space: nowrap;
 }
 .progress-cell {
   min-width: 210px;

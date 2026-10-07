@@ -13,6 +13,8 @@ interface Props {
   wasted?: number;
   remaining?: number;
   percent?: number;
+  /** 待确认张数（帧序/曝光改动后作废、待持有人重新确认） */
+  pending?: number;
   compact?: boolean;
   status?: string;
 }
@@ -22,6 +24,7 @@ const props = withDefaults(defineProps<Props>(), {
   wasted: 0,
   remaining: undefined,
   percent: undefined,
+  pending: 0,
   compact: false,
   status: '',
 });
@@ -60,6 +63,7 @@ const barColor = computed(() => {
       <span>已拍 {{ taken }} 张</span>
       <span v-if="wasted">废帧 {{ wasted }} 张</span>
       <span>剩余 {{ remainingValue }} 张</span>
+      <span v-if="pending" class="pending">待确认 {{ pending }} 张</span>
     </div>
   </div>
 </template>
@@ -106,6 +110,10 @@ const barColor = computed(() => {
   gap: 14px;
   font-size: 12px;
   color: #5a6472;
+}
+.stats .pending {
+  color: #a8730f;
+  font-weight: 600;
 }
 .compact .stats {
   gap: 10px;

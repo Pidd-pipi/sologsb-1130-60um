@@ -7,6 +7,7 @@ import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
+import { usePermitStore } from '../stores/permitStore';
 import { useLocalDraft } from '../hooks/useLocalDraft';
 import { buildFrameRange, framesToDuration } from '../utils/frameMath';
 import { addFrames } from '../db/api';
@@ -19,6 +20,7 @@ import EmptyState from '../components/common/EmptyState.vue';
 const router = useRouter();
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
+const permitStore = usePermitStore();
 
 const { draft, savedAt, reset } = useLocalDraft('shot-new', {
   code: 'S01',
@@ -95,6 +97,8 @@ async function submit() {
     const first: FrameEntry = { ...createEmptyFrame(shot.id as number, shot.startFrame), ...exposure.value, id: undefined };
     await addFrames([first]);
     await frameStore.loadForShot(shot.id as number);
+    // 签发拍摄授权：持有人取负责人，缺省为当前操作人
+    await permitStore.ensureForShot(shot);
     reset();
     await router.push(`/shots/${shot.id}`);
   } catch (e) {
@@ -170,6 +174,7 @@ function useSuggested() {
         <label class="field">
           <span>负责人</span>
           <input id="shot-owner" v-model="draft.owner" type="text" maxlength="20" data-testid="shot-owner" />
+          <small class="muted">保存后按负责人发放拍摄授权（缺省为当前操作人）</small>
         </label>
       </div>
 
