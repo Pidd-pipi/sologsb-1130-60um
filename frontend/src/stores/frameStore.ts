@@ -1,10 +1,16 @@
-/** 帧条目 store：条带选中、帧序数组、批量曝光、持久化 */
+/** 帧条目 store：条带选中、帧序数组、批量曝光、持久化（拍摄授权受控） */
 import { defineStore } from 'pinia';
 import * as api from '../db/api';
 import { toPlain } from '../db';
+import { assertHolder } from '../utils/permission';
+import { useAuthStore } from './authStore';
+import { useShotStore } from './shotStore';
 import { accumulateOffsets, estimateSpeed, frameColor, framesToDuration } from '../utils/frameMath';
 import type { BatchExposure, FrameEntry } from '../types/frame';
 import { createEmptyFrame } from '../types/frame';
+
+/** 本次改动是否触碰帧序（插入/删除/移动必然是） */
+type MutationKind = 'sequence' | 'exposure' | 'other';
 
 interface FrameState {
   frames: FrameEntry[];
@@ -50,16 +56,52 @@ export const useFrameStore = defineStore('frame', {
         this.selectedFrameNo = this.frames[0].frameNo;
       }
     },
+    /** 外部（如帧率/时长重排）原子写回后，用最新行刷新缓存 */
+    hydrate(frames: FrameEntry[]) {
+      this.frames = frames.map((f) => ({ ...f }));
+      this.dirty = false;
+    },
     select(frameNo: number | null) {
       this.selectedFrameNo = frameNo;
     },
-    /** 整段帧序落库（脱代理后写入），帧序号按数组顺序重排 */
-    async persist() {
+    /**
+     * 帧序/曝光改动统一入口：
+     * 1. 先断言当前操作员是该镜头持有人（非持有人直接拒绝，落不了库）；
+     * 2. 先在本地快照上算出新帧序；
+     * 3. 原子提交帧 + 镜头帧区间 + 实拍作废重算；
+     * 4. 写失败时本地帧序与镜头状态恢复原样（DB 事务已回滚）。
+     */
+    async commit(nextFrames: FrameEntry[], kind: MutationKind) {
       if (this.shotId === null) return;
-      const ordered = this.frames.map((f, idx) => ({ ...f, frameNo: idx + 1, shotId: this.shotId as number }));
-      await api.replaceShotFrames(this.shotId, toPlain(ordered));
-      this.frames = await api.listFrames(this.shotId);
-      this.dirty = false;
+      const shotId = this.shotId;
+      const shotStore = useShotStore();
+      const auth = useAuthStore();
+      const shot = shotStore.byId(shotId);
+      const action = kind === 'sequence' ? '改动帧序' : kind === 'exposure' ? '改动曝光' : '改动帧条目';
+      assertHolder(shot, auth.operator, action);
+
+      const ordered = nextFrames.map((f, idx) => ({
+        ...toPlain(f),
+        frameNo: idx + 1,
+        shotId,
+      }));
+      const prevFrames = this.frames;
+      const prevDirty = this.dirty;
+      this.frames = ordered;
+      this.dirty = true;
+      try {
+        const invalidate = kind !== 'other';
+        const savedShot = await api.commitShotFrames({ shotId, frames: ordered, invalidate });
+        // 用库里回读的权威行刷新（updatedAt 等）
+        this.frames = await api.listFrames(shotId);
+        this.dirty = false;
+        shotStore.mergeShot(savedShot);
+      } catch (e) {
+        // 恢复本地帧序；镜头快照由 DB 事务保证未变（帧区间/进度随事务一起回滚）
+        this.frames = prevFrames;
+        this.dirty = prevDirty;
+        throw e;
+      }
     },
     async insertAt(index: number, seed?: Partial<FrameEntry>) {
       const base = createEmptyFrame(this.shotId ?? 0, index + 1);
@@ -80,31 +122,33 @@ export const useFrameStore = defineStore('frame', {
         frameNo: index + 1,
         id: undefined,
       };
-      this.frames = [...this.frames.slice(0, index), merged, ...this.frames.slice(index)];
-      this.frames = this.frames.map((f, idx) => ({ ...f, frameNo: idx + 1 }));
-      this.dirty = true;
-      await this.persist();
+      const next = [...this.frames.slice(0, index), merged, ...this.frames.slice(index)].map((f, idx) => ({
+        ...f,
+        frameNo: idx + 1,
+      }));
+      await this.commit(next, 'sequence');
     },
     async removeAt(index: number) {
       if (this.frames.length <= 1) return;
-      this.frames = this.frames.filter((_, i) => i !== index);
-      this.frames = this.frames.map((f, idx) => ({ ...f, frameNo: idx + 1 }));
-      this.dirty = true;
-      await this.persist();
+      const next = this.frames
+        .filter((_, i) => i !== index)
+        .map((f, idx) => ({ ...f, frameNo: idx + 1 }));
+      await this.commit(next, 'sequence');
     },
     async move(from: number, to: number) {
       if (from === to || from < 0 || to < 0 || from >= this.frames.length || to >= this.frames.length) return;
       const next = this.frames.slice();
       const [moved] = next.splice(from, 1);
       next.splice(to, 0, moved);
-      this.frames = next.map((f, idx) => ({ ...f, frameNo: idx + 1 }));
-      this.dirty = true;
-      await this.persist();
+      await this.commit(
+        next.map((f, idx) => ({ ...f, frameNo: idx + 1 })),
+        'sequence',
+      );
     },
-    /** 批量套用曝光参数 */
+    /** 批量套用曝光参数（持有人专属，触碰曝光 → 已确认进度作废重算） */
     async applyBatch(batch: BatchExposure, indexes?: number[]) {
       const target = indexes && indexes.length ? new Set(indexes) : null;
-      this.frames = this.frames.map((f, idx) => {
+      const next = this.frames.map((f, idx) => {
         if (target && !target.has(idx)) return f;
         return {
           ...f,
@@ -115,18 +159,21 @@ export const useFrameStore = defineStore('frame', {
           updatedAt: Date.now(),
         };
       });
-      await this.persist();
+      await this.commit(next, 'exposure');
     },
-    /** 就地更新单帧字段（镜头详情页表格 / 条带位移量） */
+    /**
+     * 就地更新单帧字段（镜头详情页表格 / 条带位移量）。
+     * 帧序字段（张数）与曝光字段改动会作废旧确认；备注/位移等不影响实拍口径，不废旧确认。
+     */
     async patchFrame(frameNo: number, patch: Partial<FrameEntry>) {
       const idx = this.frames.findIndex((f) => f.frameNo === frameNo);
       if (idx < 0) return;
       const next = { ...this.frames[idx], ...patch, updatedAt: Date.now() };
-      this.frames = this.frames.map((f, i) => (i === idx ? next : f));
-      if (typeof next.id === 'number') {
-        const { id, ...rest } = next;
-        await api.updateFrame(id, toPlain(rest));
-      }
+      const list = this.frames.map((f, i) => (i === idx ? next : f));
+      const touchesAuth = Object.keys(patch).some(
+        (k) => k === 'shotCount' || ['exposureSec', 'aperture', 'iso', 'shutterAngle'].includes(k),
+      );
+      await this.commit(list, touchesAuth ? 'exposure' : 'other');
     },
     /** 条带单帧颜色：按曝光与位移量着色 */
     colorOf(frame: FrameEntry): string {

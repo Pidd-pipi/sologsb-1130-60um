@@ -9,6 +9,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
+import { useAuthStore } from '../stores/authStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useProgress } from '../hooks/useProgress';
 import * as api from '../db/api';
@@ -21,6 +22,7 @@ import { today } from '../utils/format';
 import FrameStrip from '../components/common/FrameStrip.vue';
 import ExposureForm from '../components/common/ExposureForm.vue';
 import ShotProgress from '../components/common/ShotProgress.vue';
+import AuthCard from '../components/common/AuthCard.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 
@@ -28,6 +30,7 @@ const route = useRoute();
 const router = useRouter();
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
+const auth = useAuthStore();
 const { frames, selectedFrameNo } = storeToRefs(frameStore);
 
 const { insertAfter, removeAt, move, patch, select, syncShotRange } = useFrameSequence();
@@ -90,52 +93,95 @@ function flash(text: string) {
   }, 3200);
 }
 
-async function changeStatus(status: ShotStatus) {
-  if (!shot.value) return;
-  await shotStore.setStatus(shotId.value, status);
-  flash(`拍摄状态已更新为「${status}」`);
+/** 是否为该镜头当前持有人：帧序/曝光/登记实拍仅持有人可用 */
+const iAmHolder = computed(() => auth.holds(shot.value));
+const holderName = computed(() => shot.value?.authHolder?.trim() ?? '');
+
+/** 统一捕获权限拒绝：授权被交出后，原持有人的动作直接收到拒绝提示 */
+function guard(e: unknown, fallback = '操作失败，请重试') {
+  flash(e instanceof Error ? e.message : fallback);
 }
 
-async function changeDuration(value: number) {
+async function changeStatus(status: ShotStatus) {
   if (!shot.value) return;
-  await shotStore.update(shotId.value, { durationSec: value });
-  flash('已按新时长重排帧区间');
+  try {
+    await shotStore.setStatus(shotId.value, status);
+    flash(`拍摄状态已更新为「${status}」`);
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function changeFps(value: number) {
   if (!shot.value) return;
-  await shotStore.update(shotId.value, { fps: value });
-  await syncShotRange();
-  flash('已按新帧率重排帧区间');
+  try {
+    await shotStore.update(shotId.value, { fps: value });
+    await syncShotRange();
+    await loadTakes();
+    flash('已按新帧率重排帧区间，已确认实拍进度已作废，请持有人重新确认');
+  } catch (e) {
+    guard(e);
+  }
+}
+
+async function changeDuration(value: number) {
+  if (!shot.value) return;
+  try {
+    await shotStore.update(shotId.value, { durationSec: value });
+    await loadTakes();
+    flash('已按新时长重排帧区间，已确认实拍进度已作废，请持有人重新确认');
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function addFrameWithExposure() {
-  await insertAfter(selectedFrameNo.value ?? frames.value[frames.value.length - 1]?.frameNo ?? null);
-  const last = frames.value[frames.value.length - 1];
-  if (last) {
-    await patch(last.frameNo, exposureDraft.value as Partial<FrameEntry>);
-    select(last.frameNo);
+  try {
+    await insertAfter(selectedFrameNo.value ?? frames.value[frames.value.length - 1]?.frameNo ?? null);
+    const last = frames.value[frames.value.length - 1];
+    if (last) {
+      await patch(last.frameNo, exposureDraft.value as Partial<FrameEntry>);
+      select(last.frameNo);
+    }
+    flash('已在帧序中插入一帧，已确认实拍进度作废，待持有人重新确认');
+  } catch (e) {
+    guard(e);
   }
-  flash('已在帧序中插入一帧');
 }
 
 async function reorder(from: number, to: number) {
-  await move(from, to);
-  flash('已移动帧并重排序号');
+  try {
+    await move(from, to);
+    flash('已移动帧并重排序号，已确认实拍进度作废，待持有人重新确认');
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function patchFrame(frameNo: number, value: Partial<FrameEntry>) {
-  await patch(frameNo, value);
+  try {
+    await patch(frameNo, value);
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function editCell(frame: FrameEntry, key: keyof FrameEntry, raw: string, numeric = true) {
   const value = numeric ? Number(raw) : raw;
-  await patch(frame.frameNo, { [key]: value } as Partial<FrameEntry>);
+  try {
+    await patch(frame.frameNo, { [key]: value } as Partial<FrameEntry>);
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function removeFrameRow(frameNo: number) {
-  await removeAt(frameNo);
-  flash('已删除该帧并重排序号');
+  try {
+    await removeAt(frameNo);
+    flash('已删除该帧并重排序号，已确认实拍进度作废，待持有人重新确认');
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function submitTake() {
@@ -146,9 +192,13 @@ async function submitTake() {
     flash('实拍张数需大于 0');
     return;
   }
-  await registerTake(shot.value, takeForm.value.date, taken, wasted);
-  await loadTakes();
-  flash(`已登记 ${taken} 张实拍，进度已回写`);
+  try {
+    await registerTake(shot.value, takeForm.value.date, taken, wasted);
+    await loadTakes();
+    flash(`已登记 ${taken} 张实拍，进度已回写；张数变化后请持有人重新确认`);
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function addProp() {
@@ -228,6 +278,18 @@ function speedOf(frame: FrameEntry) {
     <template v-else-if="shot">
       <p v-if="feedback" class="feedback" data-testid="detail-feedback">{{ feedback }}</p>
 
+      <AuthCard
+        :shot="shot"
+        :taken="consumed.taken"
+        :wasted="consumed.wasted"
+        @changed="loadTakes()"
+      />
+
+      <div v-if="!iAmHolder" class="lock-banner" data-testid="detail-lock">
+        当前由「{{ holderName || '待认领' }}」接手拍摄授权：只有持有人能登记实拍张数、改动帧序或曝光；
+        交出去以后原持有人再动帧序或曝光会被权限拒绝。
+      </div>
+
       <div class="panel">
         <div class="panel-head"><h2>镜头参数与进度</h2></div>
         <div class="two-col">
@@ -237,7 +299,7 @@ function speedOf(frame: FrameEntry) {
             <div>
               <dt>帧率</dt>
               <dd>
-                <select :value="shot.fps" data-testid="detail-fps" @change="changeFps(Number(($event.target as HTMLSelectElement).value))">
+                <select :value="shot.fps" :disabled="!iAmHolder" data-testid="detail-fps" @change="changeFps(Number(($event.target as HTMLSelectElement).value))">
                   <option v-for="f in [8, 12, 15, 24, 25, 30]" :key="f" :value="f">{{ f }} fps</option>
                 </select>
               </dd>
@@ -251,6 +313,7 @@ function speedOf(frame: FrameEntry) {
                   max="60"
                   step="0.5"
                   :value="shot.durationSec"
+                  :disabled="!iAmHolder"
                   data-testid="detail-duration"
                   @change="changeDuration(Number(($event.target as HTMLInputElement).value))"
                 />
@@ -259,6 +322,7 @@ function speedOf(frame: FrameEntry) {
             </div>
             <div><dt>帧区间</dt><dd class="mono">{{ shot.startFrame }} – {{ shot.endFrame }}（{{ sceneProgress }} s）</dd></div>
             <div><dt>负责人</dt><dd>{{ shot.owner || '未指派' }}</dd></div>
+            <div><dt>拍摄授权</dt><dd class="mono">{{ holderName || '挂起待认领' }}</dd></div>
             <div>
               <dt>拍摄状态</dt>
               <dd>
@@ -288,6 +352,7 @@ function speedOf(frame: FrameEntry) {
         <FrameStrip
           :frames="frames"
           :selected="selectedFrameNo"
+          :readonly="!iAmHolder"
           @update:selected="select"
           @reorder="reorder"
           @patch="patchFrame"
@@ -305,7 +370,7 @@ function speedOf(frame: FrameEntry) {
         <div class="panel-head">
           <h2>帧条目表格</h2>
           <div class="head-actions">
-            <button type="button" class="btn small" data-testid="insert-frame" @click="addFrameWithExposure">插入帧</button>
+            <button type="button" class="btn small" data-testid="insert-frame" :disabled="!iAmHolder" @click="addFrameWithExposure">插入帧</button>
             <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
           </div>
         </div>
@@ -329,20 +394,20 @@ function speedOf(frame: FrameEntry) {
             <tr v-for="frame in frames" :key="frame.id ?? frame.frameNo" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
               <td class="mono">{{ frame.frameNo }}</td>
               <td>
-                <select :value="frame.shotCount" @change="editCell(frame, 'shotCount', ($event.target as HTMLSelectElement).value)">
+                <select :value="frame.shotCount" :disabled="!iAmHolder" @change="editCell(frame, 'shotCount', ($event.target as HTMLSelectElement).value)">
                   <option v-for="c in shotCountOptions" :key="c" :value="c">{{ c }}</option>
                 </select>
               </td>
-              <td><input type="number" min="0.008" max="8" step="0.008" :value="frame.exposureSec" @change="editCell(frame, 'exposureSec', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="number" min="1.4" max="22" step="0.1" :value="frame.aperture" @change="editCell(frame, 'aperture', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="number" min="100" max="3200" step="100" :value="frame.iso" @change="editCell(frame, 'iso', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="number" min="45" max="360" step="1" :value="frame.shutterAngle" @change="editCell(frame, 'shutterAngle', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="text" maxlength="20" :value="frame.lighting" @change="editCell(frame, 'lighting', ($event.target as HTMLInputElement).value, false)" /></td>
-              <td><input type="number" min="-200" max="200" step="0.5" :value="frame.propOffsetMm" @change="editCell(frame, 'propOffsetMm', ($event.target as HTMLInputElement).value)" /></td>
+              <td><input type="number" min="0.008" max="8" step="0.008" :value="frame.exposureSec" :disabled="!iAmHolder" @change="editCell(frame, 'exposureSec', ($event.target as HTMLInputElement).value)" /></td>
+              <td><input type="number" min="1.4" max="22" step="0.1" :value="frame.aperture" :disabled="!iAmHolder" @change="editCell(frame, 'aperture', ($event.target as HTMLInputElement).value)" /></td>
+              <td><input type="number" min="100" max="3200" step="100" :value="frame.iso" :disabled="!iAmHolder" @change="editCell(frame, 'iso', ($event.target as HTMLInputElement).value)" /></td>
+              <td><input type="number" min="45" max="360" step="1" :value="frame.shutterAngle" :disabled="!iAmHolder" @change="editCell(frame, 'shutterAngle', ($event.target as HTMLInputElement).value)" /></td>
+              <td><input type="text" maxlength="20" :value="frame.lighting" :disabled="!iAmHolder" @change="editCell(frame, 'lighting', ($event.target as HTMLInputElement).value, false)" /></td>
+              <td><input type="number" min="-200" max="200" step="0.5" :value="frame.propOffsetMm" :disabled="!iAmHolder" @change="editCell(frame, 'propOffsetMm', ($event.target as HTMLInputElement).value)" /></td>
               <td class="muted">{{ speedOf(frame) }} mm/s</td>
               <td class="row-actions">
-                <button type="button" class="btn tiny" @click.stop="insertAfter(frame.frameNo)">后插</button>
-                <button type="button" class="btn tiny danger" :disabled="frames.length <= 1" @click.stop="removeFrameRow(frame.frameNo)">删除</button>
+                <button type="button" class="btn tiny" :disabled="!iAmHolder" @click.stop="insertAfter(frame.frameNo)">后插</button>
+                <button type="button" class="btn tiny danger" :disabled="frames.length <= 1 || !iAmHolder" @click.stop="removeFrameRow(frame.frameNo)">删除</button>
               </td>
             </tr>
           </tbody>
@@ -362,14 +427,15 @@ function speedOf(frame: FrameEntry) {
         <div class="panel">
           <div class="panel-head">
             <h2>登记实拍</h2>
-            <span class="muted">剩余 {{ consumed.remaining }} 张</span>
+            <span class="muted">剩余 {{ consumed.remaining }} 张 · 仅当前持有人可登记</span>
           </div>
           <div class="take-form">
             <label class="field"><span>拍摄日期</span><input v-model="takeForm.date" type="date" data-testid="take-date" /></label>
             <label class="field"><span>实拍张数</span><input v-model.number="takeForm.takenFrames" type="number" min="1" max="2000" step="1" data-testid="take-taken" /></label>
             <label class="field"><span>废帧数</span><input v-model.number="takeForm.wastedFrames" type="number" min="0" max="500" step="1" data-testid="take-wasted" /></label>
-            <button type="button" class="btn primary" data-testid="take-submit" @click="submitTake">登记并回写进度</button>
+            <button type="button" class="btn primary" data-testid="take-submit" :disabled="!iAmHolder" @click="submitTake">登记并回写进度</button>
           </div>
+          <p v-if="!iAmHolder" class="muted lock-note">授权不在你手上（当前持有人：{{ holderName || '待认领' }}），实拍张数登记已锁定。</p>
         </div>
       </div>
 
@@ -619,5 +685,16 @@ h1 .mono {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.lock-banner {
+  background: #fdf6e7;
+  border: 1px solid #f3e0b4;
+  color: #8a5f12;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+.lock-note {
+  margin: 6px 0 0;
 }
 </style>

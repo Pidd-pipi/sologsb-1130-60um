@@ -6,14 +6,17 @@
 import { computed, onMounted, ref } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
+import { useAuthStore } from '../stores/authStore';
 import { useProgress } from '../hooks/useProgress';
 import { formatDateTime, today } from '../utils/format';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
+import AuthCard from '../components/common/AuthCard.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import type { TakeLog } from '../types/take';
 
 const shotStore = useShotStore();
+const auth = useAuthStore();
 const { shots } = storeToRefs(shotStore);
 const { takes, summaries, overall, wasteBuckets, loadTakes, registerTake, removeTake, loading } = useProgress();
 
@@ -23,6 +26,7 @@ const feedback = ref('');
 
 const selectedShot = computed(() => (selectedShotId.value === null ? undefined : shotStore.byId(selectedShotId.value)));
 const selectedSummary = computed(() => summaries.value.find((s) => s.shotId === selectedShotId.value));
+const iAmHolder = computed(() => auth.holds(selectedShot.value));
 
 onMounted(async () => {
   if (!shotStore.ready) await shotStore.load();
@@ -54,16 +58,24 @@ async function submit() {
     flash('废帧数不能多于实拍张数');
     return;
   }
-  await registerTake(shot, form.value.date, taken, wasted);
-  await loadTakes();
-  flash(`${shot.code} 已登记 ${taken} 张，完成度回写为 ${selectedSummary.value?.percent ?? 0}%`);
+  try {
+    await registerTake(shot, form.value.date, taken, wasted);
+    await loadTakes();
+    flash(`${shot.code} 已登记 ${taken} 张，完成度回写为 ${selectedSummary.value?.percent ?? 0}%；张数变化后请持有人重新确认`);
+  } catch (e) {
+    flash(e instanceof Error ? e.message : '登记失败，请重试');
+  }
 }
 
 async function removeRow(row: TakeLog) {
   if (typeof row.id !== 'number') return;
-  await removeTake(row.id);
-  await loadTakes();
-  flash('已删除该条实拍记录');
+  try {
+    await removeTake(row.id);
+    await loadTakes();
+    flash('已删除该条实拍记录，进度已重算，确认状态已作废');
+  } catch (e) {
+    flash(e instanceof Error ? e.message : '删除失败，请重试');
+  }
 }
 </script>
 
@@ -86,6 +98,18 @@ async function removeRow(row: TakeLog) {
     <EmptyState v-if="!shots.length" title="还没有镜头" description="请先到「新建镜头」创建镜头，再登记实拍张数。" />
 
     <template v-else>
+      <AuthCard
+        v-if="selectedShot"
+        :shot="selectedShot"
+        :taken="selectedSummary?.taken ?? 0"
+        :wasted="selectedSummary?.wasted ?? 0"
+        compact
+        @changed="loadTakes()"
+      />
+      <div v-if="selectedShot && !iAmHolder" class="lock-banner" data-testid="take-lock">
+        当前由「{{ selectedShot.authHolder || '待认领' }}」接手拍摄授权，只有持有人能登记或删除实拍张数。
+      </div>
+
       <div class="two-panel">
         <div class="panel">
           <div class="panel-head"><h2>登记实拍</h2><StatusTag v-if="selectedShot" :status="selectedShot.status" /></div>
@@ -107,11 +131,12 @@ async function removeRow(row: TakeLog) {
             </label>
           </div>
           <div class="actions">
-            <button type="button" class="btn primary" data-testid="take-log-submit" @click="submit">登记实拍</button>
+            <button type="button" class="btn primary" data-testid="take-log-submit" :disabled="!iAmHolder" @click="submit">登记实拍</button>
             <span class="muted" v-if="selectedSummary">
               计划 {{ selectedSummary.planned }} 张 · 已拍 {{ selectedSummary.taken }} 张 · 剩余 {{ selectedSummary.remaining }} 张
             </span>
           </div>
+          <p v-if="selectedShot && !iAmHolder" class="muted">登记已锁定：授权不在你手上。</p>
         </div>
 
         <div class="panel">
@@ -127,6 +152,18 @@ async function removeRow(row: TakeLog) {
             :percent="selectedSummary.percent"
           />
           <p v-else class="muted">请选择镜头。</p>
+
+          <div v-if="selectedSummary" class="attest-line" data-testid="take-attest">
+            <template v-if="selectedSummary.confirmed">
+              <span class="dot ok"></span><span class="attest ok">实拍进度已确认（{{ selectedSummary.confirmedBy || selectedSummary.holder }}）</span>
+            </template>
+            <template v-else-if="selectedSummary.stale">
+              <span class="dot warn"></span><span class="attest warn">已确认进度作废（帧序/曝光或张数已改），待持有人重新确认</span>
+            </template>
+            <template v-else>
+              <span class="dot idle"></span><span class="attest muted">实拍进度尚未确认</span>
+            </template>
+          </div>
 
           <div class="waste">
             <div class="waste-title">废帧分布（按每条记录的张数分桶）</div>
@@ -145,18 +182,29 @@ async function removeRow(row: TakeLog) {
         <div class="panel-head"><h2>实拍记录清单</h2><span class="muted">共 {{ takes.length }} 条</span></div>
         <table v-if="takes.length" class="table" data-testid="take-table">
           <thead>
-            <tr><th>拍摄日期</th><th>镜号</th><th>实拍张数</th><th>废帧数</th><th>剩余张数</th><th>完成百分比</th><th>登记时间</th><th>操作</th></tr>
+            <tr><th>拍摄日期</th><th>镜号</th><th>登记人</th><th>实拍张数</th><th>废帧数</th><th>剩余张数</th><th>完成百分比</th><th>登记时间</th><th>操作</th></tr>
           </thead>
           <tbody>
             <tr v-for="row in takes" :key="row.id">
               <td class="mono">{{ row.date }}</td>
               <td class="mono">{{ row.shotCode }}</td>
+              <td>{{ row.registeredBy || '—' }}</td>
               <td>{{ row.takenFrames }}</td>
               <td>{{ row.wastedFrames }}</td>
               <td>{{ row.remainingFrames }}</td>
               <td>{{ row.percent }}%</td>
               <td class="muted">{{ formatDateTime(row.updatedAt) }}</td>
-              <td><button type="button" class="btn tiny danger" @click="removeRow(row)">删除</button></td>
+              <td>
+                <button
+                  type="button"
+                  class="btn tiny danger"
+                  :disabled="!auth.holds(shotStore.byId(row.shotId))"
+                  :title="auth.holds(shotStore.byId(row.shotId)) ? '' : '只有该镜头持有人才能删除'"
+                  @click="removeRow(row)"
+                >
+                  删除
+                </button>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -339,5 +387,42 @@ h1 {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.lock-banner {
+  background: #fdf6e7;
+  border: 1px solid #f3e0b4;
+  color: #8a5f12;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+.attest-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 12px;
+}
+.attest-line .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.dot.ok {
+  background: #3aa675;
+}
+.dot.warn {
+  background: #d99b2b;
+}
+.dot.idle {
+  background: #b9c2d0;
+}
+.attest.ok {
+  color: #1f7a52;
+  font-weight: 600;
+}
+.attest.warn {
+  color: #9a6a12;
+  font-weight: 600;
 }
 </style>

@@ -92,7 +92,7 @@ async function submit() {
       status: draft.value.status,
       owner: draft.value.owner.trim(),
     });
-    const first: FrameEntry = { ...createEmptyFrame(shot.id as number, shot.startFrame), ...exposure.value, id: undefined };
+    const first: FrameEntry = { ...createEmptyFrame(shot.id as number, 1), ...exposure.value, id: undefined };
     await addFrames([first]);
     await frameStore.loadForShot(shot.id as number);
     reset();
@@ -168,8 +168,9 @@ function useSuggested() {
           </select>
         </label>
         <label class="field">
-          <span>负责人</span>
+          <span>负责人（初始拍摄授权持有人）</span>
           <input id="shot-owner" v-model="draft.owner" type="text" maxlength="20" data-testid="shot-owner" />
+          <small class="muted">留空则授权挂起，创建后由接手人认领</small>
         </label>
       </div>
 

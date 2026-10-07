@@ -7,19 +7,23 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
+import { useAuthStore } from '../stores/authStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useLocalDraft } from '../hooks/useLocalDraft';
+import { useProgress } from '../hooks/useProgress';
 import { durationToFrames, framesToDuration } from '../utils/frameMath';
 import { APERTURE_OPTIONS, EXPOSURE_OPTIONS, ISO_OPTIONS, SHUTTER_ANGLE_OPTIONS } from '../utils/exposure';
 import type { BatchExposure, FrameEntry } from '../types/frame';
 import type { Shot } from '../types/shot';
 import FrameStrip from '../components/common/FrameStrip.vue';
 import ExposureForm from '../components/common/ExposureForm.vue';
+import AuthCard from '../components/common/AuthCard.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
+const auth = useAuthStore();
 const { shots } = storeToRefs(shotStore);
 const { frames, selectedFrameNo } = storeToRefs(frameStore);
 const { insertAfter, removeAt, move, patch, select, syncShotRange, totalDuration, fps } = useFrameSequence();
@@ -47,6 +51,10 @@ const { draft: batch, reset: resetBatch } = useLocalDraft<BatchExposure>('frame-
 const activeShot = computed<Shot | undefined>(() => (activeShotId.value === null ? undefined : shotStore.byId(activeShotId.value)));
 const planned = computed(() => (activeShot.value ? durationToFrames(activeShot.value.durationSec, activeShot.value.fps) : 0));
 const ordered = computed(() => frames.value.slice().sort((a, b) => a.frameNo - b.frameNo));
+
+const { summaries, loadTakes } = useProgress();
+const activeSummary = computed(() => summaries.value.find((s) => s.shotId === activeShotId.value));
+const iAmHolder = computed(() => auth.holds(activeShot.value));
 const exposureOptions = EXPOSURE_OPTIONS;
 const apertureOptions = APERTURE_OPTIONS;
 const isoOptions = ISO_OPTIONS;
@@ -54,6 +62,7 @@ const shutterOptions = SHUTTER_ANGLE_OPTIONS;
 
 onMounted(async () => {
   if (!shotStore.ready) await shotStore.load();
+  await loadTakes();
   const first = shots.value[0];
   if (first && typeof first.id === 'number') {
     activeShotId.value = first.id;
@@ -72,15 +81,23 @@ function flash(text: string) {
   }, 3200);
 }
 
+function guard(e: unknown) {
+  flash(e instanceof Error ? e.message : '操作失败，请重试');
+}
+
 async function doInsert() {
   if (activeShotId.value === null) return;
-  await insertAfter(selectedFrameNo.value);
-  const created = frames.value.find((f) => f.frameNo === (selectedFrameNo.value ?? 0) + 1) ?? frames.value[frames.value.length - 1];
-  if (created) {
-    await patch(created.frameNo, newFrame.value);
-    select(created.frameNo);
+  try {
+    await insertAfter(selectedFrameNo.value);
+    const created = frames.value.find((f) => f.frameNo === (selectedFrameNo.value ?? 0) + 1) ?? frames.value[frames.value.length - 1];
+    if (created) {
+      await patch(created.frameNo, newFrame.value);
+      select(created.frameNo);
+    }
+    flash('已插入一帧并重排序号，已确认实拍进度作废');
+  } catch (e) {
+    guard(e);
   }
-  flash('已插入一帧并重排序号');
 }
 
 async function doRemove() {
@@ -88,19 +105,31 @@ async function doRemove() {
     flash('请先点选要删除的帧');
     return;
   }
-  await removeAt(selectedFrameNo.value);
-  flash('已删除该帧并重排序号');
+  try {
+    await removeAt(selectedFrameNo.value);
+    flash('已删除该帧并重排序号，已确认实拍进度作废');
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function doReorder(from: number, to: number) {
-  await move(from, to);
-  flash(`已把第 ${from + 1} 个色块移动到第 ${to + 1} 位`);
+  try {
+    await move(from, to);
+    flash(`已把第 ${from + 1} 个色块移动到第 ${to + 1} 位，已确认实拍进度作废`);
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function doBatch() {
   if (activeShotId.value === null) return;
-  await frameStore.applyBatch({ ...batch.value });
-  flash('已对全部帧批量套用曝光参数');
+  try {
+    await frameStore.applyBatch({ ...batch.value });
+    flash('已对全部帧批量套用曝光参数，已确认实拍进度作废');
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function doBatchSelectedOnly() {
@@ -109,19 +138,27 @@ async function doBatchSelectedOnly() {
     return;
   }
   const index = ordered.value.findIndex((f) => f.frameNo === selectedFrameNo.value);
-  await frameStore.applyBatch({ ...batch.value }, [index]);
-  flash('已对选中帧套用曝光参数');
+  try {
+    await frameStore.applyBatch({ ...batch.value }, [index]);
+    flash('已对选中帧套用曝光参数，已确认实拍进度作废');
+  } catch (e) {
+    guard(e);
+  }
 }
 
 async function patchFrame(frameNo: number, value: Partial<FrameEntry>) {
-  await patch(frameNo, value);
+  try {
+    await patch(frameNo, value);
+  } catch (e) {
+    guard(e);
+  }
 }
 
 function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
   const index = ordered.value.findIndex((f) => f.frameNo === frame.frameNo);
   const target = index + dir;
   if (target < 0 || target >= ordered.value.length) return;
-  void move(index, target);
+  void move(index, target).catch(guard);
 }
 </script>
 
@@ -150,6 +187,17 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
     <template v-else-if="activeShot">
       <p v-if="feedback" class="feedback" data-testid="board-feedback">{{ feedback }}</p>
 
+      <AuthCard
+        :shot="activeShot"
+        :taken="activeSummary?.taken ?? 0"
+        :wasted="activeSummary?.wasted ?? 0"
+        compact
+        @changed="loadTakes()"
+      />
+      <div v-if="!iAmHolder" class="lock-banner" data-testid="board-lock">
+        你不是该镜头的拍摄授权持有人：帧序插入/删除/移动与曝光套用已锁定，当前由「{{ activeShot.authHolder || '待认领' }}」接手。
+      </div>
+
       <div class="stat-row">
         <div class="stat"><span class="label">镜号</span><span class="value small mono">{{ activeShot.code }}</span></div>
         <div class="stat"><span class="label">条带帧数</span><span class="value">{{ frames.length }}</span></div>
@@ -162,12 +210,12 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
         <div class="panel-head">
           <h2>帧序条带</h2>
           <div class="head-actions">
-            <button type="button" class="btn small" data-testid="board-insert" @click="doInsert">插入帧</button>
-            <button type="button" class="btn small danger" data-testid="board-remove" @click="doRemove">删除选中帧</button>
+            <button type="button" class="btn small" data-testid="board-insert" :disabled="!iAmHolder" @click="doInsert">插入帧</button>
+            <button type="button" class="btn small danger" data-testid="board-remove" :disabled="!iAmHolder" @click="doRemove">删除选中帧</button>
             <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
           </div>
         </div>
-        <FrameStrip :frames="ordered" :selected="selectedFrameNo" @update:selected="select" @reorder="doReorder" @patch="patchFrame" />
+        <FrameStrip :frames="ordered" :selected="selectedFrameNo" :readonly="!iAmHolder" @update:selected="select" @reorder="doReorder" @patch="patchFrame" />
       </div>
 
       <div class="two-panel">
@@ -200,8 +248,8 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
             </label>
           </div>
           <div class="actions">
-            <button type="button" class="btn primary" data-testid="batch-apply" @click="doBatch">套用到全部帧</button>
-            <button type="button" class="btn" @click="doBatchSelectedOnly">仅套用到选中帧</button>
+            <button type="button" class="btn primary" data-testid="batch-apply" :disabled="!iAmHolder" @click="doBatch">套用到全部帧</button>
+            <button type="button" class="btn" :disabled="!iAmHolder" @click="doBatchSelectedOnly">仅套用到选中帧</button>
             <button type="button" class="btn" @click="resetBatch">复位参数</button>
           </div>
         </div>
@@ -228,8 +276,8 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
               <td>{{ frame.iso }}</td>
               <td>{{ frame.propOffsetMm }}</td>
               <td class="row-actions">
-                <button type="button" class="btn tiny" :disabled="index === 0" @click.stop="shiftFrame(frame, -1)">上移</button>
-                <button type="button" class="btn tiny" :disabled="index === ordered.length - 1" @click.stop="shiftFrame(frame, 1)">下移</button>
+                <button type="button" class="btn tiny" :disabled="index === 0 || !iAmHolder" @click.stop="shiftFrame(frame, -1)">上移</button>
+                <button type="button" class="btn tiny" :disabled="index === ordered.length - 1 || !iAmHolder" @click.stop="shiftFrame(frame, 1)">下移</button>
               </td>
             </tr>
           </tbody>
@@ -419,6 +467,14 @@ h1 {
   background: #eef6ff;
   border: 1px solid #d3e4ff;
   color: #24559c;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+.lock-banner {
+  background: #fdf6e7;
+  border: 1px solid #f3e0b4;
+  color: #8a5f12;
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;

@@ -15,6 +15,8 @@ export interface TakeLog {
   remainingFrames: number;
   /** 完成百分比 0-100 */
   percent: number;
+  /** 登记人（须为该镜头当前的拍摄授权持有人） */
+  registeredBy: string;
   updatedAt: number;
 }
 
@@ -26,6 +28,7 @@ export const createEmptyTake = (shotId: number, shotCode: string): TakeLog => ({
   wastedFrames: 0,
   remainingFrames: 0,
   percent: 0,
+  registeredBy: '',
   updatedAt: Date.now(),
 });
 

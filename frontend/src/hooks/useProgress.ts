@@ -1,12 +1,18 @@
 /**
  * 拍摄进度：由实拍张数与废帧数计算镜头完成百分比与剩余张数。
  * 被 / 与 /progress 消费。
+ *
+ * 权限：只有镜头当前的拍摄授权持有人可以登记 / 删除实拍张数；
+ * 任一实拍变动都在原子事务内写入，并使已确认进度作废、需持有人重新确认。
  */
 import { computed, ref } from 'vue';
 import * as api from '../db/api';
 import { useShotStore } from '../stores/shotStore';
+import { useAuthStore } from '../stores/authStore';
+import { assertHolder } from '../utils/permission';
 import { durationToFrames } from '../utils/frameMath';
 import type { Shot } from '../types/shot';
+import { attestProgress } from '../types/shot';
 import type { TakeLog, WasteBucket } from '../types/take';
 import { createEmptyTake } from '../types/take';
 
@@ -18,6 +24,16 @@ export interface ShotProgressSummary {
   wasted: number;
   remaining: number;
   percent: number;
+  /** 拍摄授权持有人 */
+  holder: string;
+  /** 实拍进度已由持有人确认且未作废 */
+  confirmed: boolean;
+  /** 曾确认过，但帧序/曝光或张数已变动，确认已作废 */
+  stale: boolean;
+  /** 最近确认时间戳 */
+  confirmedAt: number;
+  /** 最近确认人 */
+  confirmedBy: string;
 }
 
 /** 纯函数：按实拍张数/废帧数算进度 */
@@ -32,6 +48,7 @@ export function computeProgress(planned: number, taken: number, wasted: number) 
 
 export function useProgress() {
   const shotStore = useShotStore();
+  const auth = useAuthStore();
   const takes = ref<TakeLog[]>([]);
   const loading = ref(false);
 
@@ -42,7 +59,17 @@ export function useProgress() {
       const taken = rows.reduce((sum, r) => sum + (r.takenFrames || 0), 0);
       const wasted = rows.reduce((sum, r) => sum + (r.wastedFrames || 0), 0);
       const p = computeProgress(planned, taken, wasted);
-      return { shotId: shot.id ?? 0, code: shot.code, ...p };
+      const att = attestProgress(shot, taken, wasted);
+      return {
+        shotId: shot.id ?? 0,
+        code: shot.code,
+        ...p,
+        holder: shot.authHolder ?? '',
+        confirmed: att.confirmed,
+        stale: att.stale,
+        confirmedAt: shot.confirmedAt ?? 0,
+        confirmedBy: shot.confirmedBy ?? '',
+      };
     }),
   );
 
@@ -91,8 +118,12 @@ export function useProgress() {
     return { ...createEmptyTake(shot.id ?? 0, shot.code), remainingFrames: p.remaining, percent: p.percent };
   }
 
-  /** 登记一条实拍记录，并回写镜头完成百分比 */
+  /**
+   * 登记一条实拍记录（持有人专属）：原子写入实拍记录与镜头进度，
+   * 写失败时事务回滚，授权与实拍都恢复原样并抛出，由页面提示。
+   */
   async function registerTake(shot: Shot, date: string, takenFrames: number, wastedFrames: number) {
+    assertHolder(shot, auth.operator, '登记实拍张数');
     const planned = durationToFrames(shot.durationSec, shot.fps);
     const rows = takes.value.filter((t) => t.shotId === shot.id);
     const prevTaken = rows.reduce((sum, r) => sum + (r.takenFrames || 0), 0);
@@ -106,17 +137,29 @@ export function useProgress() {
       wastedFrames,
       remainingFrames: p.remaining,
       percent: p.percent,
+      registeredBy: auth.operator,
       updatedAt: Date.now(),
     };
-    const id = await api.addTake(row);
+    const { id, shot: savedShot } = await api.registerTakeAtomic(row);
     takes.value = [{ ...row, id }, ...takes.value];
-    if (typeof shot.id === 'number') await shotStore.syncProgress(shot.id, p.percent);
+    shotStore.mergeShot(savedShot);
     return { ...row, id };
   }
 
+  /** 删除一条实拍记录（持有人专属，原子回滚） */
   async function removeTake(id: number) {
-    await api.deleteTake(id);
+    const row = takes.value.find((t) => t.id === id);
+    if (row) {
+      const shot = shotStore.byId(row.shotId);
+      assertHolder(shot, auth.operator, '删除实拍记录');
+    }
+    const shotId = await api.deleteTakeAtomic(id);
     takes.value = takes.value.filter((t) => t.id !== id);
+    // 原子删除内部已回写镜头；刷新该镜头快照到最新
+    if (typeof shotId === 'number') {
+      const fresh = await api.getShot(shotId);
+      if (fresh) shotStore.mergeShot(fresh);
+    }
   }
 
   return {

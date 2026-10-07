@@ -122,6 +122,7 @@ function goDetail(id: number | undefined) {
             <th>预计时长</th>
             <th>完成度</th>
             <th>负责人</th>
+            <th>拍摄授权持有人 / 进度确认</th>
             <th>操作</th>
           </tr>
         </thead>
@@ -145,6 +146,12 @@ function goDetail(id: number | undefined) {
               />
             </td>
             <td>{{ row.shot.owner || '未指派' }}</td>
+            <td class="auth-cell" data-testid="overview-auth">
+              <span class="holder">{{ row.shot.authHolder || '挂起待认领' }}</span>
+              <span v-if="row.summary?.confirmed" class="confirm ok">进度已确认</span>
+              <span v-else-if="row.summary?.stale" class="confirm warn">确认已作废·待重认</span>
+              <span v-else class="confirm idle">未确认</span>
+            </td>
             <td>
               <button type="button" class="btn small" @click="goDetail(row.shot.id)">查看详情</button>
             </td>
@@ -253,6 +260,37 @@ h1 {
 }
 .progress-cell {
   min-width: 210px;
+}
+.auth-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+}
+.auth-cell .holder {
+  font-weight: 600;
+  color: #24559c;
+}
+.confirm {
+  font-size: 11px;
+  border-radius: 6px;
+  padding: 1px 8px;
+  width: fit-content;
+}
+.confirm.ok {
+  color: #1f7a52;
+  background: #e6f6ee;
+  border: 1px solid #bfe6d2;
+}
+.confirm.warn {
+  color: #9a6a12;
+  background: #fdf2e4;
+  border: 1px solid #f1dbb8;
+}
+.confirm.idle {
+  color: #8a94a6;
+  background: #f2f4f8;
+  border: 1px solid #e2e7ef;
 }
 .btn {
   height: 32px;
